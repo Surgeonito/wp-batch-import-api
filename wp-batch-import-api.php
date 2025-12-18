@@ -21,7 +21,7 @@ class WP_Batch_Importer {
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_post_wp_batch_import', [$this, 'handle_import_submit']);
-
+        add_action('wp_ajax_wp_batch_get_remote_post_types', [$this, 'ajax_get_remote_post_types']);
         // AJAX step endpoint for batch importing
         add_action('wp_ajax_wp_batch_import_step', [$this, 'ajax_import_step']);
     }
@@ -121,7 +121,14 @@ class WP_Batch_Importer {
                     </tr>
                     <tr>
                         <th scope="row"><label for="post_type">Post Type</label></th>
-                        <td><input type="text" name="post_type" id="post_type" value="post" /></td>
+                        <td>
+                            <select id="remote_post_type_select" style="min-width:220px;">
+                                <option value="">Load post types from source...</option>
+                            </select>
+                            <span id="remote_post_type_status" class="description" style="margin-left:10px;"></span>
+                            <p class="description" style="margin-top:6px;">Choose a post type from the source site or type your own below.</p>
+                            <input type="text" name="post_type" id="post_type" value="post" />
+                        </td>
                     </tr>
                     <tr>
                         <th scope="row"><label for="status">Status</label></th>
@@ -138,8 +145,66 @@ class WP_Batch_Importer {
                 jQuery(function($){
                     var $form = $('#wp-batch-import-form');
                     var $statusBox = $('#wp-batch-import-status');
+                    var $postTypeSelect = $('#remote_post_type_select');
+                    var $postTypeInput = $('#post_type');
+                    var $postTypeStatus = $('#remote_post_type_status');
+                    var nonce = $('#wp_batch_import_nonce').val();
+
+                    function fetchRemotePostTypes() {
+                        var remoteUrl = $('#<?php echo $this->remote_url_option; ?>').val();
+                        var remoteToken = $('#<?php echo $this->remote_token_option; ?>').val();
+
+                        if (!remoteUrl || !remoteToken) {
+                            $postTypeSelect.prop('disabled', true);
+                            $postTypeStatus.text('Save connection settings to load source post types.');
+                            return;
+                        }
+
+                        $postTypeSelect.prop('disabled', true).empty().append('<option>Loading...</option>');
+                        $postTypeStatus.text('');
+
+                        $.post(ajaxurl, {
+                            action: 'wp_batch_get_remote_post_types',
+                            wp_batch_import_nonce: nonce
+                        }).done(function(resp){
+                            $postTypeSelect.empty();
+                            if (!resp || !resp.success || !resp.data || !resp.data.post_types) {
+                                $postTypeStatus.text('Could not load post types from source site.');
+                                $postTypeSelect.append('<option value="">Post types unavailable</option>');
+                                return;
+                            }
+
+                            var postTypes = resp.data.post_types;
+                            if (!postTypes.length) {
+                                $postTypeStatus.text('No public post types returned by source site.');
+                                $postTypeSelect.append('<option value="">Post types unavailable</option>');
+                                return;
+                            }
+
+                            $postTypeSelect.append('<option value="">Select a source post type...</option>');
+                            postTypes.forEach(function(pt){
+                                var option = $('<option>');
+                                option.val(pt.slug);
+                                option.text(pt.label + ' (' + pt.slug + ')');
+                                $postTypeSelect.append(option);
+                            });
+                            $postTypeSelect.prop('disabled', false);
+                        }).fail(function(xhr){
+                            $postTypeSelect.empty().append('<option value="">Post types unavailable</option>');
+                            $postTypeStatus.text('Error loading post types: ' + xhr.status + ' ' + xhr.statusText);
+                        });
+                    }
+
+                    $postTypeSelect.on('change', function(){
+                        var selected = $(this).val();
+                        if (selected) {
+                            $postTypeInput.val(selected);
+                        }
+                    });
 
                     if (!$form.length) return;
+
+                    fetchRemotePostTypes();
 
                     $form.on('submit', function(e){
                         // If JS is disabled, this won't run and classic submit will work.
@@ -148,7 +213,7 @@ class WP_Batch_Importer {
                         var total = parseInt($('#total_count').val(), 10) || 0;
                         var batchSize = parseInt($('#batch_size').val(), 10) || 0;
                         var startID = parseInt($('#startID').val(), 10) || 0;
-                        var postType = $('#post_type').val();
+                        var postType = $postTypeInput.val();
                         var status = $('#status').val();
                         var nonce = $('#wp_batch_import_nonce').val();
 
@@ -366,6 +431,53 @@ class WP_Batch_Importer {
             'imported' => $imported,
             'lastID'   => $lastID,
             'done'     => $done,
+        ]);
+    }
+
+    /**
+     * Fetch a list of post types from the remote export plugin for UI selection.
+     */
+    public function ajax_get_remote_post_types() {
+        if ( ! current_user_can('manage_options') ) {
+            wp_send_json_error('Not allowed', 403);
+        }
+
+        check_ajax_referer('wp_batch_import_action','wp_batch_import_nonce');
+
+        $remote_url   = get_option($this->remote_url_option, '');
+        $remote_token = get_option($this->remote_token_option, '');
+
+        if ( empty($remote_url) || empty($remote_token) ) {
+            wp_send_json_error('Remote URL or token not configured.');
+        }
+
+        $post_types_endpoint = $this->build_post_types_endpoint( $remote_url );
+
+        $response = wp_remote_get( $post_types_endpoint, [
+            'timeout' => 20,
+            'headers' => [
+                'Authorization' => 'Bearer ' . $remote_token,
+            ],
+        ]);
+
+        if ( is_wp_error($response) ) {
+            wp_send_json_error('Remote request failed: ' . $response->get_error_message());
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        if ( $code !== 200 ) {
+            wp_send_json_error('Remote request HTTP ' . $code . ' Body:' . $body);
+        }
+
+        $json = json_decode($body, true);
+        if ( ! $json || ! isset($json['post_types']) || ! is_array($json['post_types']) ) {
+            wp_send_json_error('Invalid JSON from remote.');
+        }
+
+        wp_send_json_success([
+            'post_types' => $json['post_types'],
         ]);
     }
 
@@ -634,6 +746,17 @@ class WP_Batch_Importer {
         }
 
         return (int) $new_user_id;
+    }
+    /**
+     * Convert the configured posts endpoint URL into the sibling post types endpoint.
+     */
+    private function build_post_types_endpoint( $remote_posts_url ) {
+        $remote_posts_url = strtok( $remote_posts_url, '?' );
+        $remote_posts_url = untrailingslashit( $remote_posts_url );
+
+        $base = trailingslashit( dirname( $remote_posts_url ) );
+
+        return $base . 'post-types';
     }
 
 }

@@ -80,6 +80,16 @@ class WP_Batch_Export_API {
                 ]
             ]
         );
+
+        register_rest_route(
+            self::NAMESPACE,
+            '/post-types',
+            [
+                'methods'             => 'GET',
+                'callback'            => [$this, 'handle_get_post_types'],
+                'permission_callback' => [$this, 'auth_check'],
+            ]
+        );
     }
 
     /**
@@ -101,6 +111,29 @@ class WP_Batch_Export_API {
         }
 
         return true;
+    }
+
+    public function handle_get_post_types( WP_REST_Request $request ) {
+        $post_types = get_post_types(
+            [
+                'public'   => true,
+                'show_ui'  => true,
+            ],
+            'objects'
+        );
+
+        $formatted = [];
+
+        foreach ( $post_types as $slug => $object ) {
+            $formatted[] = [
+                'slug'  => $slug,
+                'label' => $object->labels->singular_name ?? $object->label ?? $slug,
+            ];
+        }
+
+        return [
+            'post_types' => $formatted,
+        ];
     }
 
     public function filter_min_id( $where, $wp_query ) {
