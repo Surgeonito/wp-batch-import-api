@@ -351,6 +351,7 @@ class WP_Batch_Export_API {
                 'type'          => $type,
                 'return_format' => $field['return_format'] ?? '',
                 'value'         => $value,
+                'meta'          => $this->get_acf_field_metadata( $field ),
             ];
         }
 
@@ -409,6 +410,17 @@ class WP_Batch_Export_API {
 
         return $exported;
     }
+    private function get_acf_field_metadata( $field ) {
+        if ( ! is_array( $field ) ) {
+            return [];
+        }
+
+        $metadata = $field;
+        unset( $metadata['value'] );
+
+        return $metadata;
+    }
+
 
 
 }

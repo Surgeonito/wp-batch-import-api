@@ -798,16 +798,23 @@ class WP_Batch_Importer {
         }
 
         if ( is_numeric( $value ) ) {
-            return (int) $value;
+            $attachment_id = (int) $value;
+            return $this->attachment_exists( $attachment_id ) ? $attachment_id : 0;
         }
 
         if ( is_array( $value ) ) {
+            $candidate_id = 0;
             if ( ! empty( $value['id'] ) ) {
-                return (int) $value['id'];
+                $candidate_id = (int) $value['id'];
             }
             if ( ! empty( $value['ID'] ) ) {
-                return (int) $value['ID'];
+                $candidate_id = (int) $value['ID'];
             }
+
+            if ( $candidate_id && $this->attachment_exists( $candidate_id ) ) {
+                return $candidate_id;
+            }
+
             if ( ! empty( $value['url'] ) ) {
                 return $this->sideload_attachment_from_url( $value['url'], $post_id, $field_type, $value['alt'] ?? '' );
             }
@@ -819,6 +826,12 @@ class WP_Batch_Importer {
 
         return 0;
     }
+    private function attachment_exists( $attachment_id ) {
+        $attachment = get_post( $attachment_id );
+
+        return $attachment && 'attachment' === $attachment->post_type;
+    }
+
 
     private function build_acf_attachment_array( $attachment_id, $field_type ) {
         if ( ! $attachment_id ) {
