@@ -237,6 +237,7 @@ class WP_Batch_Export_API {
                 'ping_status'   => $post->ping_status,
                 'meta'          => [],
                 'taxonomies'    => [],
+                'acf'           => [],
                 'featured_image'=> null,
                 'author'        => null,
             ];
@@ -272,6 +273,10 @@ class WP_Batch_Export_API {
                     ? maybe_unserialize( $values[0] )
                     : array_map( 'maybe_unserialize', $values );
             }
+
+            // ACF fields (include metadata + file URLs when available)
+            $data['acf'] = $this->get_acf_fields_for_export( $post_id );
+
 
             // taxonomies
             $taxes = get_object_taxonomies( $post->post_type, 'names' );
@@ -313,6 +318,98 @@ class WP_Batch_Export_API {
             'sql'     => $sql,        // helpful for debugging
         ];
     }
+
+    private function get_acf_fields_for_export( $post_id ) {
+        if ( ! function_exists( 'get_field_objects' ) ) {
+            return [];
+        }
+
+        $fields = get_field_objects( $post_id );
+        if ( empty( $fields ) || ! is_array( $fields ) ) {
+            return [];
+        }
+
+        $exported = [];
+
+        foreach ( $fields as $name => $field ) {
+            if ( ! is_array( $field ) ) {
+                continue;
+            }
+
+            $value = $field['value'] ?? null;
+            $type  = $field['type'] ?? '';
+
+            if ( in_array( $type, [ 'image', 'file' ], true ) ) {
+                $value = $this->format_acf_attachment_value( $value );
+            } elseif ( 'gallery' === $type ) {
+                $value = $this->format_acf_gallery_value( $value );
+            }
+
+            $exported[ $name ] = [
+                'key'           => $field['key'] ?? '',
+                'name'          => $name,
+                'type'          => $type,
+                'return_format' => $field['return_format'] ?? '',
+                'value'         => $value,
+            ];
+        }
+
+        return [
+            'fields' => $exported,
+        ];
+    }
+
+    private function format_acf_attachment_value( $value ) {
+        $attachment_id = 0;
+
+        if ( is_numeric( $value ) ) {
+            $attachment_id = (int) $value;
+        } elseif ( is_array( $value ) ) {
+            if ( ! empty( $value['ID'] ) ) {
+                $attachment_id = (int) $value['ID'];
+            } elseif ( ! empty( $value['id'] ) ) {
+                $attachment_id = (int) $value['id'];
+            }
+        }
+
+        if ( ! $attachment_id && is_array( $value ) ) {
+            return $value;
+        }
+
+        if ( ! $attachment_id ) {
+            return $value;
+        }
+
+        $url = wp_get_attachment_url( $attachment_id );
+
+        return [
+            'id'        => $attachment_id,
+            'url'       => $url,
+            'alt'       => get_post_meta( $attachment_id, '_wp_attachment_image_alt', true ),
+            'title'     => get_the_title( $attachment_id ),
+            'mime_type' => get_post_mime_type( $attachment_id ),
+        ];
+    }
+
+    private function format_acf_gallery_value( $value ) {
+        if ( empty( $value ) ) {
+            return $value;
+        }
+
+        $items = is_array( $value ) ? $value : [];
+        $exported = [];
+
+        foreach ( $items as $item ) {
+            if ( is_numeric( $item ) ) {
+                $exported[] = $this->format_acf_attachment_value( (int) $item );
+            } elseif ( is_array( $item ) ) {
+                $exported[] = $this->format_acf_attachment_value( $item );
+            }
+        }
+
+        return $exported;
+    }
+
 
 }
 

@@ -49,7 +49,9 @@ class WP_Batch_Importer {
 
         $remote_url   = esc_attr( get_option($this->remote_url_option, '') );
         $remote_token = esc_attr( get_option($this->remote_token_option, '') );
-        $lastID = get_option($this->last_imported_id,0);
+        $last_ids = $this->get_last_imported_ids();
+        $default_post_type = 'post';
+        $lastID = $this->get_last_imported_id($default_post_type, $last_ids);
 
         // Read last run result (flash message)
         if ( isset($_GET['wp_batch_result']) ) {
@@ -148,7 +150,17 @@ class WP_Batch_Importer {
                     var $postTypeSelect = $('#remote_post_type_select');
                     var $postTypeInput = $('#post_type');
                     var $postTypeStatus = $('#remote_post_type_status');
+                    var lastImportedByPostType = <?php echo wp_json_encode($last_ids); ?>;
                     var nonce = $('#wp_batch_import_nonce').val();
+
+
+                    function setStartIdForPostType(pt) {
+                        var startVal = 0;
+                        if (pt && lastImportedByPostType && lastImportedByPostType[pt]) {
+                            startVal = parseInt(lastImportedByPostType[pt], 10) || 0;
+                        }
+                        $('#startID').val(startVal);
+                    }
 
                     function fetchRemotePostTypes() {
                         var remoteUrl = $('#<?php echo $this->remote_url_option; ?>').val();
@@ -200,11 +212,18 @@ class WP_Batch_Importer {
                         if (selected) {
                             $postTypeInput.val(selected);
                         }
+                        setStartIdForPostType(selected);
+                    });
+
+                    $postTypeInput.on('input', function(){
+                        var manual = $(this).val();
+                        setStartIdForPostType(manual);
                     });
 
                     if (!$form.length) return;
 
                     fetchRemotePostTypes();
+                    setStartIdForPostType($postTypeInput.val());
 
                     $form.on('submit', function(e){
                         // If JS is disabled, this won't run and classic submit will work.
@@ -255,6 +274,8 @@ class WP_Batch_Importer {
                                 importedTotal += imported;
                                 remaining -= imported;
                                 startID = lastID;
+                                lastImportedByPostType[postType] = startID;
+                                $('#startID').val(startID);
 
                                 $statusBox.text('Imported ' + importedTotal + ' posts so far... (last source ID: ' + lastID + ')');
 
@@ -422,7 +443,7 @@ class WP_Batch_Importer {
                 }
             }
         }
-        update_option($this->last_imported_id, $lastID);
+        $this->set_last_imported_id($post_type, $lastID);
 
         // done = no more records returned
         $done = ( $imported === 0 || empty($json['records']) );
@@ -432,6 +453,42 @@ class WP_Batch_Importer {
             'lastID'   => $lastID,
             'done'     => $done,
         ]);
+    }
+
+    private function get_last_imported_ids() {
+        $stored = get_option($this->last_imported_id, []);
+
+        if ( ! is_array($stored) ) {
+            // Backwards compatibility with the previous single-value storage.
+            $stored = [
+                'post' => (int) $stored,
+            ];
+        }
+
+        foreach ( $stored as $type => $value ) {
+            $stored[ $type ] = (int) $value;
+        }
+
+        return $stored;
+    }
+
+    private function get_last_imported_id( $post_type, $last_ids = null ) {
+        if ( null === $last_ids ) {
+            $last_ids = $this->get_last_imported_ids();
+        }
+
+        $post_type = sanitize_key( $post_type );
+
+        return isset( $last_ids[ $post_type ] ) ? (int) $last_ids[ $post_type ] : 0;
+    }
+
+    private function set_last_imported_id( $post_type, $last_id ) {
+        $post_type = sanitize_key( $post_type );
+
+        $last_ids = $this->get_last_imported_ids();
+        $last_ids[ $post_type ] = (int) $last_id;
+
+        update_option( $this->last_imported_id, $last_ids );
     }
 
     /**
@@ -598,6 +655,11 @@ class WP_Batch_Importer {
                 }
             }
         }
+        // 3b. Import ACF fields (including file/image downloads when possible)
+        if ( ! empty( $record['acf'] ) && is_array( $record['acf'] ) ) {
+            $this->import_acf_fields( $new_post_id, $record['acf'] );
+        }
+
 
         // 4. Featured image (we'll sideload from URL if present)
         if ( ! empty($record['featured_image']['url']) ) {
@@ -646,6 +708,179 @@ class WP_Batch_Importer {
 
         return $attachment_id;
     }
+
+    /**
+     * Import ACF fields from exported payload.
+     *
+     * @param int   $post_id
+     * @param array $acf_payload
+     */
+    private function import_acf_fields( $post_id, $acf_payload ) {
+        if ( empty( $acf_payload['fields'] ) || ! is_array( $acf_payload['fields'] ) ) {
+            return;
+        }
+
+        foreach ( $acf_payload['fields'] as $field_name => $field_data ) {
+            if ( ! is_array( $field_data ) ) {
+                continue;
+            }
+
+            $field_key = $field_data['key'] ?? '';
+            $field_type = $field_data['type'] ?? '';
+            $return_format = $field_data['return_format'] ?? '';
+            $value = $field_data['value'] ?? null;
+
+            if ( in_array( $field_type, [ 'image', 'file' ], true ) ) {
+                $value = $this->prepare_acf_attachment_value_for_import( $value, $post_id, $field_type, $return_format );
+            } elseif ( 'gallery' === $field_type ) {
+                $value = $this->prepare_acf_gallery_value_for_import( $value, $post_id, $return_format );
+            }
+
+            if ( function_exists( 'update_field' ) ) {
+                $field_identifier = $field_key ? $field_key : $field_name;
+                update_field( $field_identifier, $value, $post_id );
+            } else {
+                update_post_meta( $post_id, $field_name, $value );
+                if ( $field_key ) {
+                    update_post_meta( $post_id, '_' . $field_name, $field_key );
+                }
+            }
+        }
+    }
+
+    private function prepare_acf_attachment_value_for_import( $value, $post_id, $field_type, $return_format ) {
+        $attachment_id = $this->resolve_acf_attachment_id( $value, $post_id, $field_type );
+        if ( ! $attachment_id ) {
+            return $value;
+        }
+
+        if ( 'url' === $return_format ) {
+            return wp_get_attachment_url( $attachment_id );
+        }
+
+        if ( 'array' === $return_format ) {
+            return $this->build_acf_attachment_array( $attachment_id, $field_type );
+        }
+
+        return $attachment_id;
+    }
+
+    private function prepare_acf_gallery_value_for_import( $value, $post_id, $return_format ) {
+        if ( empty( $value ) ) {
+            return $value;
+        }
+
+        $items = is_array( $value ) ? $value : [];
+        $attachment_ids = [];
+        foreach ( $items as $item ) {
+            $attachment_id = $this->resolve_acf_attachment_id( $item, $post_id, 'image' );
+            if ( $attachment_id ) {
+                $attachment_ids[] = $attachment_id;
+            }
+        }
+
+        if ( 'url' === $return_format ) {
+            return array_map( 'wp_get_attachment_url', $attachment_ids );
+        }
+
+        if ( 'array' === $return_format ) {
+            return array_map( function( $attachment_id ) {
+                return $this->build_acf_attachment_array( $attachment_id, 'image' );
+            }, $attachment_ids );
+        }
+
+        return $attachment_ids;
+    }
+
+    private function resolve_acf_attachment_id( $value, $post_id, $field_type ) {
+        if ( empty( $value ) ) {
+            return 0;
+        }
+
+        if ( is_numeric( $value ) ) {
+            return (int) $value;
+        }
+
+        if ( is_array( $value ) ) {
+            if ( ! empty( $value['id'] ) ) {
+                return (int) $value['id'];
+            }
+            if ( ! empty( $value['ID'] ) ) {
+                return (int) $value['ID'];
+            }
+            if ( ! empty( $value['url'] ) ) {
+                return $this->sideload_attachment_from_url( $value['url'], $post_id, $field_type, $value['alt'] ?? '' );
+            }
+        }
+
+        if ( is_string( $value ) && filter_var( $value, FILTER_VALIDATE_URL ) ) {
+            return $this->sideload_attachment_from_url( $value, $post_id, $field_type );
+        }
+
+        return 0;
+    }
+
+    private function build_acf_attachment_array( $attachment_id, $field_type ) {
+        if ( ! $attachment_id ) {
+            return [];
+        }
+
+        $url = wp_get_attachment_url( $attachment_id );
+
+        $data = [
+            'ID'       => $attachment_id,
+            'id'       => $attachment_id,
+            'url'      => $url,
+            'title'    => get_the_title( $attachment_id ),
+            'mime_type'=> get_post_mime_type( $attachment_id ),
+        ];
+
+        if ( 'image' === $field_type ) {
+            $data['alt'] = get_post_meta( $attachment_id, '_wp_attachment_image_alt', true );
+        }
+
+        return $data;
+    }
+
+    private function sideload_attachment_from_url( $url, $parent_post_id, $field_type, $alt = '' ) {
+        if ( 'file' === $field_type ) {
+            return $this->sideload_file_as_attachment( $url, $parent_post_id );
+        }
+
+        return $this->sideload_image_as_attachment( $url, $parent_post_id, $alt );
+    }
+
+    /**
+     * Download remote file (non-image) and attach to post.
+     */
+    private function sideload_file_as_attachment( $file_url, $parent_post_id ) {
+        if ( ! function_exists('download_url') ) {
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+        }
+
+        $tmp = download_url( $file_url );
+        if ( is_wp_error( $tmp ) ) {
+            return 0;
+        }
+
+        $file_array = [
+            'name'     => basename( parse_url( $file_url, PHP_URL_PATH ) ),
+            'tmp_name' => $tmp,
+        ];
+
+        $attachment_id = media_handle_sideload( $file_array, $parent_post_id );
+
+        if ( is_wp_error( $attachment_id ) ) {
+            @unlink( $tmp );
+            return 0;
+        }
+
+        return $attachment_id;
+    }
+
+
 
     /**
      * Get or create an author user based on exported author data.
